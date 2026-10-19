@@ -26,6 +26,10 @@ export class Player extends EventTarget {
     this.recs = { piano: null, voice: null };
     this._want = { piano: false, voice: false };
     this._blocked = { piano: 0, voice: 0 };
+    // 录音音轨的增益链：MediaElementSource → Gain → 压缩器 → 输出
+    this.overlayGains = null;
+    this.overlayTargets = { piano: 1, voice: 1 };
+    this._overlayGraphTried = false;
     this._gapTimer = 0;
     this._raf = 0;
     this._lastEmit = 0;
@@ -148,6 +152,11 @@ export class Player extends EventTarget {
       if (!el) continue;
       el.volume = this.mix[k].muted ? 0 : this.mix[k].volume;
       el.muted = this.mix[k].muted;
+      // 增益节点只负责「放大到够响」，用户滑杆仍然控制相对音量（元素 volume）
+      const node = this.overlayGains && this.overlayGains[k];
+      if (node) {
+        try { node.gain.value = this.overlayTargets[k] || 1; } catch { /* ignore */ }
+      }
     }
   }
 
@@ -256,6 +265,68 @@ export class Player extends EventTarget {
       this._want[kind] = false;
       if (el && !el.paused) el.pause();
     }
+  }
+
+  /* ------------------------- 录音音轨增益 ------------------------- */
+
+  get overlayGraphEnabled() {
+    return !!this.overlayGains;
+  }
+
+  /**
+   * 建立录音音轨的 WebAudio 增益链。元素自身的 volume 上限是 1，
+   * 麦克风录进来的声音往往比原声小十几 dB，只能靠增益节点放大。
+   * 必须在用户手势里调用（AudioContext 需要 resume）。
+   */
+  ensureOverlayGraph(ctx) {
+    if (this._overlayGraphTried) return this.overlayGraphEnabled;
+    this._overlayGraphTried = true;
+    if (!ctx || !this.audioEls.piano || !this.audioEls.voice) return false;
+    try {
+      const comp = ctx.createDynamicsCompressor();
+      // 温和的限幅，避免放大后爆音
+      comp.threshold.value = -14;
+      comp.knee.value = 24;
+      comp.ratio.value = 6;
+      comp.attack.value = 0.004;
+      comp.release.value = 0.22;
+      comp.connect(ctx.destination);
+
+      const gains = {};
+      for (const kind of ['piano', 'voice']) {
+        const el = this.audioEls[kind];
+        const src = this.mediaSources?.[kind] || ctx.createMediaElementSource(el);
+        this.mediaSources = this.mediaSources || {};
+        this.mediaSources[kind] = src;
+        const g = ctx.createGain();
+        g.gain.value = this.overlayTargets[kind] || 1;
+        src.connect(g);
+        g.connect(comp);
+        gains[kind] = g;
+      }
+      this.overlayGains = gains;
+      this.overlayComp = comp;
+      this.applyVolumes();
+      return true;
+    } catch (err) {
+      console.warn('[player] 录音增益链建立失败，退回元素音量', err);
+      this.overlayGains = null;
+      return false;
+    }
+  }
+
+  /** @param {number} gain 线性增益，1 = 原始音量 */
+  setOverlayGain(kind, gain) {
+    const g = Math.max(0, Math.min(32, Number(gain) || 1));
+    this.overlayTargets[kind] = g;
+    const node = this.overlayGains && this.overlayGains[kind];
+    if (node) {
+      try { node.gain.value = g; } catch { /* ignore */ }
+    }
+  }
+
+  getOverlayGain(kind) {
+    return this.overlayTargets[kind] || 1;
   }
 
   /* ------------------------- 传输控制 ------------------------- */

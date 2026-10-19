@@ -242,3 +242,29 @@ test('zip：写入 store 后能原样读回（含二进制与 UTF-8 文件名）
   assert.equal((await zip.bytes('media/piano-abc.m4a')).length, 4);
   assert.equal(await zip.bytes('nope'), null);
 });
+
+/* ------------------- 录音响度 / 回放增益 ------------------- */
+
+test('loudnessReport 报告峰值与 RMS', async () => {
+  const { loudnessReport } = await import('../src/audio.js');
+  const sr = 8000;
+  const s = new Float32Array(sr * 2);
+  for (let i = 0; i < s.length; i++) s[i] = Math.sin((2 * Math.PI * 440 * i) / sr) * 0.5;
+  const r = loudnessReport(s, sr);
+  assert.ok(Math.abs(r.peak - 0.5) < 0.01, `peak=${r.peak}`);
+  assert.ok(Math.abs(r.rmsDb - (-9.03)) < 0.6, `rmsDb=${r.rmsDb}`);
+  const half = loudnessReport(s, sr, { from: 0, to: 1 });
+  assert.ok(half.samples <= sr + 1);
+});
+
+test('gainForLoudness：小声音被放大，够响的不动，爆音被限', async () => {
+  const { gainForLoudness } = await import('../src/audio.js');
+  const target = 0.1;                                  // 约 -20 dBFS
+  const quiet = gainForLoudness({ peak: 0.02, rms: 0.01 }, target);
+  assert.ok(quiet >= 9.5 && quiet <= 10.5, `quiet gain=${quiet}`); // 10 倍
+  const loud = gainForLoudness({ peak: 0.6, rms: 0.2 }, target);
+  assert.equal(loud, 1);                               // 已经比目标响，不衰减
+  const loudPeak = gainForLoudness({ peak: 0.9, rms: 0.02 }, target);
+  assert.ok(loudPeak <= 1.6, `peak cap=${loudPeak}`);   // 峰值大的不让无限放大
+  assert.equal(gainForLoudness({ peak: 0, rms: 0 }, target), 1); // 静音不放大
+});

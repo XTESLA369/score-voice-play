@@ -27,6 +27,7 @@ export function defaultSettings() {
     autoPlayOnTap: true,   // 点击段落文字自动播放
     singleSegmentLoop: true, // 单句重复：点句子只循环该句
     showKaraoke: true,
+    autoLoudness: true,    // 录音回放自动放大到与原声相当
     webAudioMix: false,    // 把原声接入 WebAudio 混音（iOS 上滑杆无效时打开）
     lyricText: '',
   };

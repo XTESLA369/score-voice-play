@@ -155,3 +155,36 @@ export function normalizeInPlace(samples, targetPeak = 0.92) {
   if (g > 1.02) for (let i = 0; i < samples.length; i++) samples[i] *= g;
   return g;
 }
+
+/** 峰值 / RMS（dBFS），可选只统计一段区间 */
+export function loudnessReport(samples, sampleRate, { from = 0, to = null } = {}) {
+  const start = Math.max(0, Math.floor(from * sampleRate));
+  const end = Math.min(samples.length, Math.ceil((to == null ? samples.length / sampleRate : to) * sampleRate));
+  let peak = 0;
+  let sum = 0;
+  let n = 0;
+  for (let i = start; i < end; i++) {
+    const v = samples[i];
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+    sum += v * v;
+    n++;
+  }
+  const rms = n ? Math.sqrt(sum / n) : 0;
+  const db = (x) => (x > 1e-9 ? 20 * Math.log10(x) : -120);
+  return { peak, rms, peakDb: db(peak), rmsDb: db(rms), samples: n };
+}
+
+/**
+ * 计算「把这段录音拉到参考响度」需要的线性增益。
+ * @param {{peak:number,rms:number}} take 录音响度
+ * @param {number} targetRms 目标 RMS（线性，比如原声同段的 RMS）
+ */
+export function gainForLoudness(take, targetRms, { maxGain = 16, peakCeiling = 1.35 } = {}) {
+  if (!take || !(take.rms > 1e-7) || !(targetRms > 1e-7)) return 1;
+  let g = targetRms / take.rms;
+  g = Math.min(maxGain, Math.max(1, g));
+  // 峰值别冲太狠（后面还有压缩器兜底）
+  if (take.peak > 1e-6) g = Math.min(g, Math.max(1, peakCeiling / take.peak));
+  return Math.round(g * 100) / 100;
+}
