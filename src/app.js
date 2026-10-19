@@ -8,12 +8,13 @@ import { Waveform } from './waveform.js';
 import { store, requestPersistence, storageEstimate, putMedia, getMedia, delMedia } from './db.js';
 import * as S from './state.js';
 import {
-  decodeBlob, prepareForAnalysis, computePeaks, resumeAudio, fmtTime, fmtBytes,
+  decodeBlob, prepareForAnalysis, computePeaks, resumeAudio, fmtTime, fmtBytes, resample, toMono,
   normalizeInPlace, parseTime, audioContext, loudnessReport, gainForLoudness,
 } from './audio.js';
 import { extractFeatures, compareTakes, compareVocal, sliceFeatures } from './analyze.js';
 import { Recorder, countIn, recorderSupported } from './recorder.js';
 import { createZip, readZip } from './zip.js';
+import { encodeWav, softLimitInPlace } from './wav.js';
 
 const MAX_ANALYSIS_SECONDS = 300;
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5];
@@ -175,18 +176,6 @@ function bindRecorder() {
 /* ==================================================================== *
  *  设置 / 播放器同步
  * ==================================================================== */
-
-/** 录音音轨的增益链要在用户手势里建立（AudioContext 才能 resume） */
-function ensureOverlayGraph() {
-  if (app.player.overlayGraphEnabled) return Promise.resolve(true);
-  if (!app.project) return Promise.resolve(false);
-  if (app.project.settings.autoLoudness === false) return Promise.resolve(false);
-  // 没有录音时不接入 WebAudio，保持和以前完全一致的行为
-  if (!app.project.recordings.length) return Promise.resolve(false);
-  return resumeAudio()
-    .then((ctx) => app.player.ensureOverlayGraph(ctx))
-    .catch(() => false);
-}
 
 /** 等第一次用户手势再接入 WebAudio，否则在挂起的 AudioContext 上接线会没声音 */
 function armWebAudioMix() {
@@ -904,7 +893,6 @@ function playSegment(segId, { record = false, fromStart = true } = {}) {
     app.player.setRepeats(1);
     app.player.setInterval(s.interval);
   }
-  ensureOverlayGraph();
   if (fromStart) app.player.seek(seg.a, { silent: true });
   refreshOverlays();
   if (!record) {
@@ -964,7 +952,6 @@ function togglePlay() {
   });
   app.player.setRepeats(useLoop ? app.project.settings.repeats : 1);
   app.player.setInterval(app.project.settings.interval);
-  ensureOverlayGraph();
   refreshOverlays();
   app.player.unlockOverlays();
   app.player.play();
@@ -1012,7 +999,6 @@ function setInterval(v) {
 
 function setVolume(kind, v) {
   if (!app.project) return;
-  if (kind !== 'orig') ensureOverlayGraph();
   app.project.settings.mix[kind].volume = v;
   app.player.setVolume(kind, v);
   S.saveProject(app.project);
@@ -1066,6 +1052,10 @@ async function doRefreshOverlays() {
   for (const kind of ['piano', 'voice']) {
     const rec = pickRecording(kind, a, b);
     if (!rec) { app.player.setOverlay(kind, null); continue; }
+    // 老录音（或上次没来得及处理）：先把文件标准化，再挂上去
+    if (!rec.normalized && app.project.settings.autoLoudness !== false) {
+      try { await normalizeRecordingTake(rec); } catch (err) { console.warn('[app] 录音标准化失败', err); }
+    }
     let url = app.urlCache.get(rec.id);
     if (!url) {
       try {
@@ -1082,12 +1072,6 @@ async function doRefreshOverlays() {
       } catch { app.player.setOverlay(kind, null); continue; }
     }
     app.player.setOverlay(kind, { url, start: rec.start, duration: rec.duration });
-    // 录音电平通常比原声低十几 dB：用增益节点把它拉回同一响度
-    let gain = 1;
-    if (app.project.settings.autoLoudness !== false) {
-      gain = Number.isFinite(rec.gain) ? rec.gain : await ensureRecordingGain(rec);
-    }
-    app.player.setOverlayGain(kind, gain);
   }
   app.ui.updateMixerAvailability(app.project);
 }
@@ -1140,7 +1124,6 @@ async function recordSegment(segId, kind) {
   if (app.recStarting) return; // 连点两下的保护（getUserMedia 还没回来）
   app.recStarting = true;
   const s = app.project.settings;
-  ensureOverlayGraph();
   playSegment(seg.id, { record: true });
   app.player.pause();
   // iOS 关键：在用户手势内先把媒体元素「解锁」，否则 await 之后的 play() 会被拒绝
@@ -1261,7 +1244,9 @@ async function finishRecording({ cancelled = false } = {}) {
   S.saveProject(app.project, { immediate: true });
   app.ui.updateMixerAvailability(app.project);
   app.ui.updateSegmentScores(app.project, segId);
-  ensureOverlayGraph();
+  if (app.project.settings.autoLoudness !== false) {
+    try { await normalizeRecordingTake(rec); } catch (err) { console.warn('[app] 录音标准化失败', err); }
+  }
   await refreshOverlays();
 
   // 分析评分（异步，不阻塞）
@@ -1274,7 +1259,7 @@ async function finishRecording({ cancelled = false } = {}) {
     const sc = rec.score;
     if (sc && sc.ok) {
       const kindLabel = kind === 'piano' ? '钢琴' : '人声';
-      const gainTip = rec.gain > 1.4 ? `，回放已自动放大 ×${rec.gain.toFixed(1)}` : '';
+      const gainTip = (rec.boost || 1) > 1.4 ? `，响度已标准化 ×${rec.boost.toFixed(1)}` : '';
       const gainWord = Number.isFinite(sc.overall) ? '' : '';
       app.ui.toast(`${kindLabel}已保存：综合 ${sc.overall} 分（音准 ${sc.pitch} · 节奏 ${sc.rhythm}${gainWord}）${gainTip}`);
       if (rec.loudness && rec.loudness.peakDb < -26) {
@@ -1361,8 +1346,9 @@ async function scoreRecording(rec, seg) {
 
   rec.score = { ...score, refSource, at: Date.now() };
   rec.trimStart = trimmed.offset;
-  rec.loudness = { peak: rawLoud.peak, rms: rawLoud.rms, peakDb: rawLoud.peakDb, rmsDb: rawLoud.rmsDb };
-  rec.gain = gainForLoudness(rawLoud, await targetRmsFor(seg, rec.kind));
+  if (!rec.normalized) {
+    rec.loudness = { peak: rawLoud.peak, rms: rawLoud.rms, peakDb: rawLoud.peakDb, rmsDb: rawLoud.rmsDb };
+  }
 
   // 用起音对齐修正录音在视频时间轴上的起点，播放时才能对上
   const shift = estimateAlignment(localRef, takeFeat, 0.6);
@@ -1446,17 +1432,51 @@ async function targetRmsFor(seg, kind) {
   return referenceRmsForSegment(seg);
 }
 
-/** 老录音没有算过增益时补算（只算一次，存进项目里） */
-async function ensureRecordingGain(rec) {
-  if (Number.isFinite(rec.gain)) return rec.gain;
-  const data = await getTakeSamples(rec);
-  if (!data) return 1;
+/**
+ * 把录音文件本身标准化：解码 → 按目标响度放大 → 软限幅 → 重存成 16-bit WAV。
+ * 这样 <audio> 直接用原始文件就能放得够响，完全不需要 WebAudio 增益
+ *（iOS 上把 <audio> 接到 WebAudio 会掉采样，听起来就是一卡一卡、中间断截）。
+ */
+async function normalizeRecordingTake(rec, { force = false } = {}) {
+  if (rec.normalized && !force) return;
+  const blob = await getMedia(rec.blobKey);
+  if (!blob) return;
+  const buffer = await decodeBlob(blob);
+  if (!buffer) return;
+
+  const srcRate = buffer.sampleRate;
+  let mono = toMono(buffer);
+  const loud = loudnessReport(mono, srcRate);
   const seg = app.project.segments.find((s) => s.id === rec.segId) || { a: rec.start, b: rec.end };
-  rec.loudness = { peak: data.loud.peak, rms: data.loud.rms, peakDb: data.loud.peakDb, rmsDb: data.loud.rmsDb };
   const target = await targetRmsFor(seg, rec.kind);
-  rec.gain = gainForLoudness(data.loud, target);
+  const boost = gainForLoudness(loud, target);
+
+  for (let i = 0; i < mono.length; i++) mono[i] *= boost;
+  softLimitInPlace(mono, 0.72);
+
+  let rate = srcRate;
+  if (rate > 44100) { mono = resample(mono, rate, 44100); rate = 44100; }
+
+  const wav = encodeWav(mono, rate);
+  const newKey = `rec_${rec.id}_n${Date.now().toString(36)}`;
+  await putMedia(newKey, wav);
+
+  const oldKey = rec.blobKey;
+  rec.blobKey = newKey;
+  rec.mime = 'audio/wav';
+  rec.size = wav.size;
+  rec.duration = mono.length / rate;
+  rec.end = rec.start + rec.duration;
+  rec.normalized = true;
+  rec.boost = boost;
+  rec.gain = 1; // 运行时不再放大
+  rec.loudness = { peak: loud.peak, rms: loud.rms, peakDb: loud.peakDb, rmsDb: loud.rmsDb };
+
+  if (oldKey && oldKey !== newKey) await delMedia(oldKey);
+  app.takeSamplesCache.delete(rec.id);
+  const oldUrl = app.urlCache.get(rec.id);
+  if (oldUrl) { try { URL.revokeObjectURL(oldUrl); } catch { /* ignore */ } app.urlCache.delete(rec.id); }
   S.saveProject(app.project);
-  return rec.gain;
 }
 
 /** 参考特征从 (a-0.3) 开始计时，这里裁到 [a,b]（sliceFeatures 用绝对时间轴，返回的时间从 0 开始） */
@@ -1598,7 +1618,7 @@ function scoreBlockHTML(title, rec, count) {
       <div class="s">参考：${escapeHtml(sc.refSource || '原声')}</div>
     </div>
     <div class="metric">${metrics}</div>
-    <div class="s" style="margin-top:8px">差的成分 ${100 - sc.overall} · 起音对齐 ${Math.round((sc.onsetRecall || 0) * 100)}%${sc.meanAbsCents ? ` · 平均偏差 ${Math.round(sc.meanAbsCents)}¢` : ''}${rec.gain > 1.05 ? ` · 回放自动放大 ×${rec.gain.toFixed(1)}` : ''}</div>
+    <div class="s" style="margin-top:8px">差的成分 ${100 - sc.overall} · 起音对齐 ${Math.round((sc.onsetRecall || 0) * 100)}%${sc.meanAbsCents ? ` · 平均偏差 ${Math.round(sc.meanAbsCents)}¢` : ''}${(rec.boost || 1) > 1.05 ? ` · 响度标准化 ×${rec.boost.toFixed(1)}` : ''}</div>
   </div>`;
 }
 
@@ -1621,7 +1641,7 @@ function openRecordingsSheet(segId = null) {
     const active = app.project.activeRecs[rec.kind] === rec.id;
     item.innerHTML = `<div class="grow">
       <div class="t">${kindLabel} · ${rec.score?.ok ? `综合 <b>${rec.score.overall}</b>` : '未评分'}</div>
-      <div class="s">${seg ? `${fmtTime(seg.a)} ~ ${fmtTime(seg.b)}` : '无段落'} · ${dur.toFixed(1)}s · ${fmtBytes(rec.size || 0)}${rec.gain > 1.05 ? ` · 播放放大 ×${rec.gain.toFixed(1)}` : ''}${rec.loudness ? ` · 原始 ${rec.loudness.peakDb.toFixed(0)}dBFS` : ''} · ${new Date(rec.createdAt).toLocaleString('zh-CN', { hour12: false })}</div>
+      <div class="s">${seg ? `${fmtTime(seg.a)} ~ ${fmtTime(seg.b)}` : '无段落'} · ${dur.toFixed(1)}s · ${fmtBytes(rec.size || 0)}${(rec.boost || 1) > 1.05 ? ` · 已标准化 ×${rec.boost.toFixed(1)}` : ''}${rec.loudness ? ` · 原始 ${rec.loudness.peakDb.toFixed(0)}dBFS` : ''} · ${new Date(rec.createdAt).toLocaleString('zh-CN', { hour12: false })}</div>
     </div>`;
     const play = mkBtn('试听', 'btn ghost', async () => {
       const blob = await getMedia(rec.blobKey);
@@ -1631,18 +1651,10 @@ function openRecordingsSheet(segId = null) {
       const cleanup = () => URL.revokeObjectURL(url);
       a.addEventListener('ended', cleanup);
       a.addEventListener('error', cleanup);
-      // 试听也带上放大，听感才和正式播放一致
-      try {
-        const ctx = await resumeAudio();
-        const gain = Number.isFinite(rec.gain) ? rec.gain : await ensureRecordingGain(rec);
-        const src = ctx.createMediaElementSource(a);
-        const g = ctx.createGain();
-        g.gain.value = app.project.settings.autoLoudness === false ? 1 : Math.max(1, gain);
-        src.connect(g).connect(ctx.destination);
-        await a.play();
-      } catch {
-        a.play().catch(cleanup);
+      if (!rec.normalized && app.project.settings.autoLoudness !== false) {
+        await normalizeRecordingTake(rec).catch(() => {});
       }
+      a.play().catch(cleanup);
     });
     const use = mkBtn(active ? '使用中' : '使用', 'btn ghost', async () => {
       app.project.activeRecs[rec.kind] = rec.id;
@@ -1930,7 +1942,7 @@ async function openSettingsSheet() {
       </select></div>
     <div class="row"><span class="hint" style="flex:1">录音时开启系统降噪/回声消除<br/><small>开启后钢琴音色会被处理，评分更宽松（人声建议开，钢琴建议关）</small></span>
       <button class="btn ${s.processing ? 'on' : 'ghost'}" id="set_proc">${s.processing ? '开' : '关'}</button></div>
-    <div class="row"><span class="hint" style="flex:1">录音回放自动放大<br/><small>麦克风录到的钢琴/人声通常比原声小十几 dB，开启后自动放大到与原声相当。<br/>关闭后只按原始电平播放（关闭需要重新打开 App 才会完全断开 WebAudio）</small></span>
+    <div class="row"><span class="hint" style="flex:1">录音响度自动标准化<br/><small>麦克风录到的钢琴/人声通常比原声小十几 dB。开启后保存时会把文件本身放大到与原声相当（重存为 WAV，不依赖 WebAudio，iOS 上更稳）。<br/>关闭则保留原始电平，文件更小</small></span>
       <button class="btn ${s.autoLoudness === false ? 'ghost' : 'on'}" id="set_loudness">${s.autoLoudness === false ? '关' : '开'}</button></div>
     <div class="row"><span class="hint" style="flex:1">原声走 WebAudio 混音<br/><small>iPad 上如果「原声」滑杆拖动没反应，打开这个（改完需要刷新页面）</small></span>
       <button class="btn ${app.player.graphEnabled ? 'on' : 'ghost'}" id="set_graph">${app.player.graphEnabled ? '已启用' : '关'}</button></div>
@@ -1963,12 +1975,10 @@ async function openSettingsSheet() {
   body.querySelector('#set_countin').addEventListener('change', (ev) => { s.countIn = Number(ev.target.value); S.saveProject(app.project); });
   body.querySelector('#set_loudness').addEventListener('click', async () => {
     s.autoLoudness = s.autoLoudness === false;
-    await ensureOverlayGraph();
-    await refreshOverlays();
     S.saveProject(app.project, { immediate: true });
     app.ui.toast(s.autoLoudness
-      ? '已开启：录音会放大到和原声差不多'
-      : '已关闭：录音按原始电平播放（重新打开 App 后彻底不经过 WebAudio）');
+      ? '已开启：以后录的音会把文件本身标准化到和原声差不多'
+      : '已关闭：以后录的音保留原始电平（旧录音不受影响）');
     rebind();
   });
   body.querySelector('#set_graph').addEventListener('click', async () => {

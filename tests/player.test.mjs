@@ -28,19 +28,6 @@ class FakeEl extends EventTarget {
   removeAttribute(k) { delete this.attrs[k]; if (k === 'src') this.src = ''; }
 }
 
-const param = (v) => ({ value: v });
-
-function fakeCtx() {
-  const made = [];
-  return {
-    destination: { name: 'dest' },
-    createDynamicsCompressor: () => ({ threshold: param(-24), knee: param(30), ratio: param(12), attack: param(0.003), release: param(0.25), connect: () => {}, name: 'comp' }),
-    createGain: () => { const g = { gain: param(1), connect: () => {}, name: 'gain' }; made.push(g); return g; },
-    createMediaElementSource: (el) => ({ el, connect: () => {}, name: `src:${el.name}` }),
-    made,
-  };
-}
-
 const { Player } = await import('../src/player.js');
 
 function makePlayer() {
@@ -91,42 +78,17 @@ test('音量 / 静音：元素 volume 与 muted 同步', () => {
   assert.equal(piano.volume, 0.7);
 });
 
-test('录音增益链：建链前先记录目标，建链后把增益写进节点', () => {
-  const { p } = makePlayer();
-  p.setOverlayGain('piano', 4.5);
-  p.setOverlayGain('voice', 2);
-  assert.equal(p.getOverlayGain('piano'), 4.5);
-  assert.equal(p.overlayGraphEnabled, false, '还没建链');
-
-  const ctx = fakeCtx();
-  const okGraph = p.ensureOverlayGraph(ctx);
-  assert.equal(okGraph, true);
-  assert.equal(p.overlayGraphEnabled, true);
-  assert.equal(p.overlayGains.piano.gain.value, 4.5, '建链时带上已有目标');
-  assert.equal(p.overlayGains.voice.gain.value, 2);
-
-  p.setOverlayGain('piano', 8);
-  assert.equal(p.overlayGains.piano.gain.value, 8, '建链后实时更新');
-
-  // 重复调用不会重复接线
-  const before = p.overlayGains;
-  p.ensureOverlayGraph(ctx);
-  assert.equal(p.overlayGains, before);
-});
-
-test('增益链：上下文不可用时安全退回（不抛异常）', () => {
+test('叠加音轨音量完全由元素 volume 控制（不经过 WebAudio，iOS 上不会掉采样）', () => {
   const { p, piano } = makePlayer();
-  const badCtx = { createDynamicsCompressor() { throw new Error('nope'); } };
-  assert.equal(p.ensureOverlayGraph(badCtx), false);
-  assert.equal(p.overlayGraphEnabled, false);
-  // 退回后仍然按元素音量播放
-  p.setVolume('piano', 0.8);
-  assert.equal(piano.volume, 0.8);
+  p.setVolume('piano', 0.35);
+  assert.equal(piano.volume, 0.35);
+  assert.equal(p.overlayGraphEnabled, undefined, '播放器不应再暴露 WebAudio 增益链');
+  assert.equal(typeof p.ensureOverlayGraph, 'undefined');
+  assert.equal(typeof p.setOverlayGain, 'undefined');
 });
 
 test('叠加音轨：按录制起点对齐，起点之前保持暂停', () => {
   const { p, piano } = makePlayer();
-  p.ensureOverlayGraph(fakeCtx());
   p.setOverlay('piano', { url: 'blob:x', start: 5, duration: 4 });
   p.state = 'playing';
   p.video.paused = false;
@@ -151,4 +113,47 @@ test('叠加音轨：清空后移除 src 并暂停', () => {
   p.setOverlay('piano', null);
   assert.equal(piano.src, '');
   assert.equal(piano.paused, true);
+});
+
+test('叠加音轨：小偏差用变速追赶，不写 currentTime（避免断音）', () => {
+  const { p, piano } = makePlayer();
+  p.setOverlay('piano', { url: 'blob:z', start: 0, duration: 10 });
+  p.state = 'playing';
+  p.video.paused = false;
+  p.video.currentTime = 2;
+  let seeks = 0;
+  const desc = Object.getOwnPropertyDescriptor(FakeEl.prototype, 'currentTime') || null;
+  Object.defineProperty(piano, 'currentTime', {
+    get() { return this._ct || 0; },
+    set(v) { seeks++; this._ct = v; },
+  });
+  piano._ct = 1.9;              // 落后 0.1 秒
+  piano.paused = false;
+  p._want.piano = true;
+  p.syncOverlays();
+  assert.equal(seeks, 0, '小偏差不应 seek');
+  assert.ok(piano.playbackRate > p.rate, `应当加速追赶，rate=${piano.playbackRate}`);
+  assert.ok(desc !== null || true);
+});
+
+test('叠加音轨：大偏差才硬对齐，并且有冷却', () => {
+  const { p, piano } = makePlayer();
+  p.setOverlay('piano', { url: 'blob:w', start: 0, duration: 10 });
+  p.state = 'playing';
+  p.video.paused = false;
+  p.video.currentTime = 5;
+  let seeks = 0;
+  Object.defineProperty(piano, 'currentTime', {
+    get() { return this._ct || 0; },
+    set(v) { seeks++; this._ct = v; },
+  });
+  piano._ct = 1.0;              // 落后 4 秒
+  piano.paused = false;
+  p._want.piano = true;
+  p.syncOverlays();
+  assert.equal(seeks, 1, '大偏差应当硬对齐一次');
+  assert.ok(Math.abs(piano._ct - 5) < 0.01);
+  piano._ct = 1.0;
+  p.syncOverlays();             // 冷却期内不再 seek
+  assert.equal(seeks, 1, '900ms 冷却内不重复 seek');
 });

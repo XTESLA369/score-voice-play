@@ -26,10 +26,6 @@ export class Player extends EventTarget {
     this.recs = { piano: null, voice: null };
     this._want = { piano: false, voice: false };
     this._blocked = { piano: 0, voice: 0 };
-    // 录音音轨的增益链：MediaElementSource → Gain → 压缩器 → 输出
-    this.overlayGains = null;
-    this.overlayTargets = { piano: 1, voice: 1 };
-    this._overlayGraphTried = false;
     this._gapTimer = 0;
     this._raf = 0;
     this._lastEmit = 0;
@@ -152,11 +148,6 @@ export class Player extends EventTarget {
       if (!el) continue;
       el.volume = this.mix[k].muted ? 0 : this.mix[k].volume;
       el.muted = this.mix[k].muted;
-      // 增益节点只负责「放大到够响」，用户滑杆仍然控制相对音量（元素 volume）
-      const node = this.overlayGains && this.overlayGains[k];
-      if (node) {
-        try { node.gain.value = this.overlayTargets[k] || 1; } catch { /* ignore */ }
-      }
     }
   }
 
@@ -221,40 +212,83 @@ export class Player extends EventTarget {
     return this.currentTime - rec.start;
   }
 
+  /**
+   * 叠加音轨对齐。
+   *  · 小偏差（几十毫秒）用 playbackRate 轻微追赶，不产生断音
+   *  · 大偏差才硬 seek，而且有冷却，避免「seek → 解码清空 → 再 seek」的卡顿循环
+   */
   syncOverlays(force = false) {
     const t = this.currentTime;
+    const baseRate = this.rate;
+    const now = performance.now();
     for (const kind of ['piano', 'voice']) {
       const rec = this.recs[kind];
       const el = this.audioEls[kind];
       if (!el || !rec) continue;
+      const dur = rec.duration || (rec.end - rec.start) || 0;
       const local = t - rec.start;
-      const inRange = this.playing && local >= -0.02 && local <= (rec.duration || (rec.end - rec.start) || 0) + 0.05;
+      const inRange = this.playing && local >= -0.02 && local <= dur + 0.05;
+
       if (!inRange) {
         if (this._want[kind] || !el.paused) {
           this._want[kind] = false;
           el.pause();
         }
-        if (local < -0.02) { try { el.currentTime = 0; } catch { /* ignore */ } }
+        if (local < -0.02 && el.currentTime > 0.02) {
+          try { el.currentTime = 0; } catch { /* ignore */ }
+        }
+        if (Math.abs(el.playbackRate - baseRate) > 0.001) {
+          try { el.playbackRate = baseRate; } catch { /* ignore */ }
+        }
         continue;
       }
+
       // 播放被系统拒绝后（iOS 未授权自动播放）退避重试，避免每秒 60 次的失败风暴
-      const blockedUntil = this._blocked[kind] || 0;
-      if (blockedUntil > performance.now()) continue;
+      if ((this._blocked[kind] || 0) > now) continue;
+
       const want = Math.max(0, local);
       const startEl = () => {
         this._want[kind] = true;
         try { el.currentTime = want; } catch { /* ignore */ }
-        el.playbackRate = this.rate;
+        try { el.playbackRate = baseRate; } catch { /* ignore */ }
         el.play().catch(() => {
           this._want[kind] = false;
           this._blocked[kind] = performance.now() + 1200;
         });
       };
+
       if (el.paused && !this._want[kind]) {
         startEl();
-      } else if (force || Math.abs(el.currentTime - want) > DRIFT_TOLERANCE) {
-        if (el.paused) startEl();
-        else { try { el.currentTime = want; } catch { /* ignore */ } }
+        continue;
+      }
+
+      const drift = el.currentTime - want; // >0 说明录音跑在前面
+      const abs = Math.abs(drift);
+      const hardSync = (bypassCooldown = false) => {
+        const last = this._lastHardSync?.[kind];
+        if (!bypassCooldown && last != null && now - last < 900) return false;
+        this._lastHardSync = this._lastHardSync || {};
+        this._lastHardSync[kind] = now;
+        try { el.currentTime = want; } catch { /* ignore */ }
+        try { el.playbackRate = baseRate; } catch { /* ignore */ }
+        return true;
+      };
+
+      if (force) { hardSync(true); continue; }
+      if (el.paused) { startEl(); continue; }
+
+      if (abs > 0.55) {
+        hardSync();
+      } else if (abs > 0.05) {
+        // 轻微变速追赶：落后就快一点，超前就慢一点
+        const nudge = abs > 0.25 ? 0.1 : 0.04;
+        const sign = drift < 0 ? 1 : -1;
+        const next = Math.max(0.4, Math.min(2.2, baseRate * (1 + sign * nudge)));
+        if (Math.abs(el.playbackRate - next) > 0.005) {
+          try { el.playbackRate = next; } catch { /* ignore */ }
+        }
+      } else if (Math.abs(el.playbackRate - baseRate) > 0.005) {
+        try { el.playbackRate = baseRate; } catch { /* ignore */ }
       }
     }
   }
@@ -265,68 +299,6 @@ export class Player extends EventTarget {
       this._want[kind] = false;
       if (el && !el.paused) el.pause();
     }
-  }
-
-  /* ------------------------- 录音音轨增益 ------------------------- */
-
-  get overlayGraphEnabled() {
-    return !!this.overlayGains;
-  }
-
-  /**
-   * 建立录音音轨的 WebAudio 增益链。元素自身的 volume 上限是 1，
-   * 麦克风录进来的声音往往比原声小十几 dB，只能靠增益节点放大。
-   * 必须在用户手势里调用（AudioContext 需要 resume）。
-   */
-  ensureOverlayGraph(ctx) {
-    if (this._overlayGraphTried) return this.overlayGraphEnabled;
-    this._overlayGraphTried = true;
-    if (!ctx || !this.audioEls.piano || !this.audioEls.voice) return false;
-    try {
-      const comp = ctx.createDynamicsCompressor();
-      // 温和的限幅，避免放大后爆音
-      comp.threshold.value = -14;
-      comp.knee.value = 24;
-      comp.ratio.value = 6;
-      comp.attack.value = 0.004;
-      comp.release.value = 0.22;
-      comp.connect(ctx.destination);
-
-      const gains = {};
-      for (const kind of ['piano', 'voice']) {
-        const el = this.audioEls[kind];
-        const src = this.mediaSources?.[kind] || ctx.createMediaElementSource(el);
-        this.mediaSources = this.mediaSources || {};
-        this.mediaSources[kind] = src;
-        const g = ctx.createGain();
-        g.gain.value = this.overlayTargets[kind] || 1;
-        src.connect(g);
-        g.connect(comp);
-        gains[kind] = g;
-      }
-      this.overlayGains = gains;
-      this.overlayComp = comp;
-      this.applyVolumes();
-      return true;
-    } catch (err) {
-      console.warn('[player] 录音增益链建立失败，退回元素音量', err);
-      this.overlayGains = null;
-      return false;
-    }
-  }
-
-  /** @param {number} gain 线性增益，1 = 原始音量 */
-  setOverlayGain(kind, gain) {
-    const g = Math.max(0, Math.min(32, Number(gain) || 1));
-    this.overlayTargets[kind] = g;
-    const node = this.overlayGains && this.overlayGains[kind];
-    if (node) {
-      try { node.gain.value = g; } catch { /* ignore */ }
-    }
-  }
-
-  getOverlayGain(kind) {
-    return this.overlayTargets[kind] || 1;
   }
 
   /* ------------------------- 传输控制 ------------------------- */

@@ -268,3 +268,56 @@ test('gainForLoudness：小声音被放大，够响的不动，爆音被限', as
   assert.ok(loudPeak <= 1.6, `peak cap=${loudPeak}`);   // 峰值大的不让无限放大
   assert.equal(gainForLoudness({ peak: 0, rms: 0 }, target), 1); // 静音不放大
 });
+
+/* ------------------- 录音标准化（WAV 编码 / 软限幅 / 增益） ------------------- */
+
+test('encodeWav → decodeWav 往返保持电平与时长', async () => {
+  const { encodeWav, decodeWav, softLimitInPlace } = await import('../src/wav.js');
+  const sr = 16000;
+  const n = sr; // 1 秒
+  const s = new Float32Array(n);
+  for (let i = 0; i < n; i++) s[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * 0.3;
+  const blob = encodeWav(s, sr);
+  assert.equal(blob.type, 'audio/wav');
+  assert.equal(blob.size, 44 + n * 2);
+  const back = decodeWav(await blob.arrayBuffer());
+  assert.equal(back.sampleRate, sr);
+  assert.equal(back.samples.length, n);
+  let maxErr = 0;
+  for (let i = 0; i < n; i += 37) maxErr = Math.max(maxErr, Math.abs(back.samples[i] - s[i]));
+  assert.ok(maxErr < 0.001, `最大误差 ${maxErr}`);
+});
+
+test('标准化：小音量录音放大后接近目标响度，且不削爆', async () => {
+  const { encodeWav, softLimitInPlace } = await import('../src/wav.js');
+  const { loudnessReport, gainForLoudness } = await import('../src/audio.js');
+  const sr = 16000;
+  const n = sr;
+  const quiet = new Float32Array(n);
+  for (let i = 0; i < n; i++) quiet[i] = Math.sin((2 * Math.PI * 440 * i) / sr) * 0.02; // 很小声
+  const loud = loudnessReport(quiet, sr);
+  assert.ok(loud.rmsDb < -35, `原始 rms=${loud.rmsDb}`);
+
+  const target = 0.1;                    // 目标 RMS ≈ -20 dBFS
+  const boost = gainForLoudness(loud, target);
+  const out = Float32Array.from(quiet, (v) => v * boost);
+  softLimitInPlace(out, 0.72);
+  const after = loudnessReport(out, sr);
+  assert.ok(after.rmsDb > loud.rmsDb + 12, `放大后应明显更响: ${loud.rmsDb} → ${after.rmsDb}`);
+  assert.ok(after.peak <= 1.0, `不能超过 0 dBFS: ${after.peak}`);
+  // 编码后的文件能正常读回
+  const back = (await import('../src/wav.js')).decodeWav(await encodeWav(out, sr).arrayBuffer());
+  assert.equal(back.samples.length, n);
+});
+
+test('softLimitInPlace 只压缩峰值，不改变小信号', async () => {
+  const { softLimitInPlace } = await import('../src/wav.js');
+  const s = new Float32Array([0, 0.1, -0.1, 0.5, -0.5, 0.99, -0.99]);
+  const copy = Float32Array.from(s);
+  softLimitInPlace(copy, 0.7);
+  assert.equal(copy[0], 0);
+  assert.ok(Math.abs(copy[1] - 0.1) < 1e-6, `小信号不变: ${copy[1]}`);
+  assert.ok(Math.abs(copy[3] - 0.5) < 1e-6, '0.5 < knee(0.7) 应保持不变');
+  assert.ok(copy[5] < 0.99 && copy[5] > 0.7, `0.99 被压到 ${copy[5]}`);
+  assert.ok(Math.abs(copy[6] + copy[5]) < 1e-6, '负峰值对称');
+});

@@ -5,7 +5,7 @@
  *  视频/录音都存在 IndexedDB，不经过网络，所以不做 Range 处理。
  */
 
-const VERSION = 'svp-v2';
+const VERSION = 'svp-v3';
 const SHELL = [
   './',
   './index.html',
@@ -21,6 +21,7 @@ const SHELL = [
   './src/db.js',
   './src/state.js',
   './src/zip.js',
+  './src/wav.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/icon-maskable-512.png',
