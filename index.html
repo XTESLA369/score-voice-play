@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>谱声练习 · ScoreVoicePlay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="谱声练习" />
+<meta name="theme-color" content="#0b0f16" />
+<meta name="format-detection" content="telephone=no" />
+<link rel="manifest" href="./manifest.webmanifest" />
+<link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+<link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path d="M4 18V9m5 9V5m5 13v-6m5 6V7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+      </svg>
+      <input id="title" class="title" value="未命名练习" aria-label="练习名称" spellcheck="false" />
+    </div>
+    <div class="topActions">
+      <button id="btnProjects" class="btn" type="button" title="保存 / 打开 / 导入导出项目">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" style="vertical-align:-4px">
+          <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.2c.7 0 1.3.3 1.8.8l.9 1c.4.4.9.7 1.5.7h5.6A2.5 2.5 0 0 1 21 10v7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        </svg>
+        项目</button>
+      <button id="btnPickVideo" class="btn primary" type="button">选择五线谱视频</button>
+      <button id="btnPickAudio" class="btn" type="button" title="可选：导入参考音频用于波形与评分">参考音频</button>
+      <button id="btnMenu" class="btn icon" type="button" aria-label="更多">···</button>
+    </div>
+  </header>
+
+  <main class="main">
+    <section class="stage" id="stage">
+      <div class="videoWrap">
+        <video id="video" playsinline webkit-playsinline preload="metadata" x-webkit-airplay="allow"></video>
+        <div class="emptyStage" id="emptyStage">
+          <div class="emptyIcon">
+            <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+              <rect x="2.5" y="5" width="19" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="1.6"/>
+              <path d="M10 9.5v5l4.5-2.5z" fill="currentColor"/>
+            </svg>
+          </div>
+          <h2>还没有载入视频</h2>
+          <p>从相册选择一段五线谱演奏视频（也可以选屏幕录制）。<br/>视频只存在本机，不会上传。</p>
+          <button class="btn primary big" id="btnPickVideo2" type="button">从相册选择视频</button>
+        </div>
+
+        <div class="stageOverlay">
+          <div class="badge" id="timeBadge">0:00.00 / 0:00.00</div>
+          <div class="badge loopBadge" id="loopBadge" hidden></div>
+          <div class="badge ratioBadge" id="ratioBadge" hidden></div>
+        </div>
+
+        <div class="recHud" id="recHud" hidden>
+          <div class="recTop"><span class="recDot"></span><span id="recKind">录音</span><span id="recTime">0.0s</span></div>
+          <div class="recMeter"><i id="recLevel"></i></div>
+          <div class="recNote" id="recNote">—</div>
+        </div>
+
+        <div class="segHint" id="segHint" hidden></div>
+      </div>
+    </section>
+
+    <aside class="panel" id="panel">
+      <div class="panelToolbar">
+        <button class="chipBtn" id="btnSetA" type="button"><b>A</b>设置A</button>
+        <button class="chipBtn" id="btnSetB" type="button"><b>B</b>设置B</button>
+        <button class="chipBtn" id="btnAddRow" type="button">添加行</button>
+        <button class="chipBtn" id="btnDelRow" type="button">删除行</button>
+        <button class="chipBtn" id="btnLyrics" type="button">分句 / 歌词</button>
+        <button class="chipBtn" id="btnIo" type="button">导入 / 导出</button>
+        <button class="chipBtn toggle" id="btnRepeatOne" type="button">单句重复</button>
+      </div>
+      <div class="segList" id="segList"></div>
+      <div class="panelFoot">
+        <span id="segCount">0 段</span>
+        <span id="storageInfo" class="dim"></span>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="transport">
+    <div class="waveWrap">
+      <div class="waveHead">
+        <span class="tcur" id="tCur">0:00.00</span>
+        <span class="tab" id="tAB">A -- · B --</span>
+        <span class="tdur" id="tDur">0:00.00</span>
+      </div>
+      <canvas id="wave"></canvas>
+    </div>
+
+    <div class="controls">
+      <div class="ctlGroup transportBtns">
+        <button class="tbtn" id="btnBack" type="button" aria-label="后退">−5s</button>
+        <button class="tbtn play" id="btnPlay" type="button" aria-label="播放/暂停">
+          <svg viewBox="0 0 24 24" width="24" height="24" id="playIcon"><path d="M8 5.5v13l11-6.5z" fill="currentColor"/></svg>
+        </button>
+        <button class="tbtn" id="btnFwd" type="button" aria-label="前进">+5s</button>
+        <button class="tbtn" id="btnSpeed" type="button">1.0×</button>
+      </div>
+
+      <div class="chips" id="repeatChips"></div>
+      <div class="chips" id="intervalChips"></div>
+
+      <div class="mixer" id="mixer">
+        <div class="track" data-kind="orig">
+          <button class="muteBtn on" data-kind="orig" type="button">原声</button>
+          <input class="slider" type="range" min="0" max="100" value="100" data-kind="orig" aria-label="原声音量" />
+        </div>
+        <div class="track" data-kind="piano">
+          <button class="muteBtn" data-kind="piano" type="button">钢琴</button>
+          <input class="slider" type="range" min="0" max="100" value="95" data-kind="piano" aria-label="钢琴录音音量" />
+        </div>
+        <div class="track" data-kind="voice">
+          <button class="muteBtn" data-kind="voice" type="button">人声</button>
+          <input class="slider" type="range" min="0" max="100" value="100" data-kind="voice" aria-label="人声音量" />
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <div class="sheetBackdrop" id="sheetBackdrop" hidden></div>
+  <div class="sheet" id="sheet" hidden>
+    <div class="sheetHandle"></div>
+    <div class="sheetHead">
+      <h3 id="sheetTitle">标题</h3>
+      <button class="btn icon" id="sheetClose" type="button" aria-label="关闭">✕</button>
+    </div>
+    <div class="sheetBody" id="sheetBody"></div>
+    <div class="sheetFoot" id="sheetFoot"></div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <input type="file" id="fileVideo" accept="video/*" hidden />
+  <input type="file" id="fileAudio" accept="audio/*,video/*" hidden />
+  <input type="file" id="fileJson" accept="application/json,.json,.zip,.svp,application/zip" hidden />
+  <audio id="audioPiano" preload="auto"></audio>
+  <audio id="audioVoice" preload="auto"></audio>
+</div>
+<script type="module" src="./src/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "score-voice-play",
+  "version": "1.0.0",
+  "private": true,
+  "description": "iPad 五线谱视频分段循环练习 PWA（AB 段落 / 双备注 / 钢琴与人声录音对比）",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "start:https": "node server.mjs --https",
+    "test": "node --test tests/*.test.mjs"
+  }
+}
